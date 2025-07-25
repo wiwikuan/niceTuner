@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>不囉唆的調音器 by 好和弦</title>
+    <style>
+        body {
+            margin: 20px;
+            text-align: left;
+        }
+
+        h3 {
+        	margin: 10px 0;
+        }
+        
+        /* 偵測結果顯示區域的樣式 */
+        #output {
+            height: 60px;
+            font-family: monospace;  /* 使用等寬字體，確保對齊 */
+            font-variant-ligatures: none;              /* CSS3 標準方法 */
+            font-feature-settings: "liga" 0, "clig" 0; /* OpenType 功能控制 */
+            font-size: 14px;
+            background-color: white;
+            overflow: hidden;        /* 隱藏超出範圍的內容 */
+            white-space: pre-line;   /* 這樣才能換行 */
+        }
+        
+        /* 頻率視覺化畫布的樣式 */
+        #canvas {
+            border: 1px solid black;
+            background-color: white;
+            margin: 10px 0;
+            display: block;
+        }
+        
+        /* 狀態顯示區域的樣式 */
+        .status {
+            font-size: 14px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h3>不囉唆的調音器 by 好和弦 <a href="https://nicechord.com">NiceChord.com</a></h3>
+    
+    <!-- 開始和停止偵測的按鈕 -->
+    <button id="startBtn" onclick="startDetection()">開始</button>
+    <button id="stopBtn" onclick="stopDetection()" disabled>停止</button>
+    
+    <!-- 狀態顯示區域 -->
+    <div id="status" class="status"></div>
+    
+    <!-- 頻率視覺化畫布，寬320像素，高200像素 -->
+    <canvas id="canvas" width="320" height="200"></canvas>
+    
+    <!-- 偵測結果顯示區域 -->
+    <div id="output"></div>
+
+    <script>
+        // ===== 全域變數宣告 =====
+        
+        // Web Audio API 相關變數
+        let audioContext;          // 音訊處理環境
+        let mediaStream;           // 麥克風音訊串流
+        let analyser;              // 音訊分析器，用於獲取頻域和時域資料
+        
+        // 控制變數
+        let isDetecting = false;   // 是否正在偵測音高
+        let animationId;           // 動畫幀ID，用於停止動畫循環
+        
+        // UI
+        let outputArea;            // 結果顯示區域
+        let statusDiv;             // 狀態顯示區域
+        let canvas;                // 畫布元素
+        let ctx;                   // 畫布 2D 繪圖環境
+        
+        // 視覺化相關變數
+        let canvasX = 0;           // 畫布上的當前 X 座標（游標位置）
+        let frequencyHistory = []; // 儲存歷史頻率點，用於繪製連續線條
+        let smoothedFrequency = null; // 經過平滑處理的頻率值
+        
+        // 強力平滑機制的變數（用於穩定顯示，避免數值跳動）
+        let previousValueToDisplay = 0;    // 上一次顯示的數值
+        let smoothingCount = 0;            // 平滑計數器
+        let smoothingThreshold = 5;        // 頻率差異閾值（Hz），小於此值認為是相似的
+        let smoothingCountThreshold = 4;   // 需要連續多少次相似才確認穩定
+        let lastDrawTime = 0;              // 上次繪圖時間，用於判斷是否要開始新線段
+        let shouldStartNewLine = false;    // 是否應該開始新的線段
+        
+        /**
+         * 自動相關函數 (Auto-correlation)
+         * 這是音高偵測的核心演算法，改編自 Chris Wilson 的 PitchDetect
+         * 
+         * 原理：
+         * 1. 音訊訊號是週期性的波形，相同的波形會重複出現
+         * 2. 透過計算訊號與自己在不同時間延遲下的相關性
+         * 3. 找出相關性最高的延遲時間，這個時間就是一個週期的長度
+         * 4. 週期的倒數就是頻率
+         * 
+         * @param {Float32Array} buffer - 音訊時域資料
+         * @param {number} sampleRate - 取樣率
+         * @returns {number} 偵測到的頻率，-1 表示未偵測到
+         */
+        function autoCorrelate(buffer, sampleRate) {
+            var SIZE = buffer.length;
+            
+            // 步驟1：計算 RMS (Root Mean Square) 來判斷訊號強度
+            var sumOfSquares = 0;
+            for (var i = 0; i < SIZE; i++) {
+                var val = buffer[i];
+                sumOfSquares += val * val;
+            }
+            var rootMeanSquare = Math.sqrt(sumOfSquares / SIZE);
+            
+            // 如果訊號太弱，直接回傳 -1（未偵測到）
+            if (rootMeanSquare < 0.01) {
+                return -1;
+            }
+
+            // 步驟2：找出訊號的有效範圍，去除前後的靜音部分
+            var r1 = 0;      // 開始位置
+            var r2 = SIZE - 1; // 結束位置
+            var threshold = 0.2; // 閾值
+
+            // 從前面找出第一個超過閾值的位置
+            for (var i = 0; i < SIZE / 2; i++) {
+                if (Math.abs(buffer[i]) < threshold) {
+                    r1 = i;
+                    break;
+                }
+            }
+
+            // 從後面找出最後一個超過閾值的位置
+            for (var i = 1; i < SIZE / 2; i++) {
+                if (Math.abs(buffer[SIZE - i]) < threshold) {
+                    r2 = SIZE - i;
+                    break;
+                }
+            }
+
+            // 截取有效範圍的訊號
+            buffer = buffer.slice(r1, r2);
+            SIZE = buffer.length;
+
+            // 步驟3：計算自動相關函數
+            // c[i] 代表訊號與自己延遲 i 個樣本後的相關性
+            var c = new Array(SIZE).fill(0);
+            for (let i = 0; i < SIZE; i++) {
+                for (let j = 0; j < SIZE - i; j++) {
+                    c[i] = c[i] + buffer[j] * buffer[j + i];
+                }
+            }
+
+            // 步驟4：找出第一個極小值之後的位置
+            // 這是為了避開 c[0]（它總是最大的）
+            var d = 0;
+            while (c[d] > c[d + 1]) {
+                d++;
+            }
+
+            // 步驟5：在 d 之後找出相關性最高的位置
+            var maxValue = -1;
+            var maxIndex = -1;
+            for (var i = d; i < SIZE; i++) {
+                if (c[i] > maxValue) {
+                    maxValue = c[i];
+                    maxIndex = i;
+                }
+            }
+
+            var T0 = maxIndex; // 基本週期（以樣本數計算）
+
+            // 步驟6：使用拋物線插值法精確計算週期
+            // 這可以得到小數點的精確度，而不只是整數樣本
+            var x1 = c[T0 - 1]; // 前一點
+            var x2 = c[T0];     // 當前點
+            var x3 = c[T0 + 1]; // 後一點
+
+            // 拋物線插值公式
+            var a = (x1 + x3 - 2 * x2) / 2;
+            var b = (x3 - x1) / 2;
+            if (a) {
+                T0 = T0 - b / (2 * a);
+            }
+
+            // 步驟7：將週期轉換為頻率
+            // 頻率 = 取樣率 / 週期
+            return sampleRate / T0;
+        }
+        
+        /**
+         * 計算頻率偏離正確音高的音分 (cents)
+         * 音分是音樂中衡量音高差異的單位，1個半音 = 100音分
+         * 
+         * 原理：
+         * 1. 找出最接近的標準音高（12平均律）
+         * 2. 計算實際頻率與標準頻率的比值
+         * 3. 轉換為音分單位
+         * 
+         * @param {number} frequency - 偵測到的頻率
+         * @returns {number} 偏離標準音高的音分數（正數表示偏高，負數表示偏低）
+         */
+        function getCentsOffset(frequency) {
+            const A4 = 440; // A4 的標準頻率
+            if (frequency <= 0) return 0;
+            
+            // 計算與 A4 相差幾個半音
+            const halfStepsFromA4 = 12 * Math.log2(frequency / A4);
+            
+            // 找出最接近的半音
+            const roundedHalfSteps = Math.round(halfStepsFromA4);
+            
+            // 計算標準頻率
+            const correctFreq = A4 * Math.pow(2, roundedHalfSteps / 12);
+            
+            // 計算偏差的音分數
+            // 1200音分 = 1個八度，100音分 = 1個半音
+            const centsOffset = Math.round(1200 * Math.log2(frequency / correctFreq));
+            
+            return centsOffset;
+        }
+        
+        /**
+         * 將頻率轉換為音符名稱（如 C4, A#3 等）
+         * 
+         * 原理：
+         * 1. 以 A4 = 440Hz 為基準
+         * 2. 計算與 A4 相差幾個半音
+         * 3. 根據12平均律對應到音符和八度
+         * 
+         * @param {number} frequency - 頻率值
+         * @returns {string} 音符名稱，如 "C4", "A#3"，無效頻率回傳 "---"
+         */
+        function frequencyToNote(frequency) {
+            // 12個半音的名稱
+            const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+            const A4 = 440;        // A4 的頻率
+            const A4_INDEX = 69;   // A4 在 MIDI 音符編號系統中的位置
+            
+            if (frequency <= 0) return '---';
+            
+            // 計算與 A4 相差幾個半音
+            const halfStepsFromA4 = Math.round(12 * Math.log2(frequency / A4));
+            const keyNumber = A4_INDEX + halfStepsFromA4;
+            
+            // 檢查是否在有效範圍內（MIDI 音符範圍 0-127）
+            if (keyNumber < 0 || keyNumber > 127) return '---';
+            
+            // 計算八度數（C4 是第4八度）
+            const octave = Math.floor(keyNumber / 12) - 1;
+            
+            // 計算在八度內的音符位置
+            const noteIndex = keyNumber % 12;
+            
+            return noteNames[noteIndex] + octave;
+        }
+        
+        /**
+         * 格式化顯示頻率、音符和音分偏差
+         * （這個函數在目前的程式中沒有使用，但保留供參考）
+         * 
+         * @param {number} frequency - 頻率值
+         * @returns {string} 格式化的字串，如 "440.00 Hz, A4 [+0]"
+         */
+        function formatFrequencyDisplay(frequency) {
+            const freq = frequency.toFixed(2);
+            const note = frequencyToNote(frequency);
+            const cents = getCentsOffset(frequency);
+            const centsDisplay = cents >= 0 ? `[+${cents}]` : `[${cents}]`;
+            return `${freq} Hz, ${note} ${centsDisplay}`;
+        }
+        
+        /**
+         * 生成調音準度的視覺化顯示
+         * 使用 ASCII 字符繪製一個準度指示器
+         * 
+         * 格式：[左邊|右邊] 其中 | 代表完美準確
+         * - 表示準確範圍
+         * < 表示偏低（往左）
+         * > 表示偏高（往右）
+         * 
+         * @param {number} frequency - 頻率值
+         * @returns {string} 包含頻率、音符和準度指示器的字串
+         */
+        function getTuningDisplay(frequency) {
+            const note = frequencyToNote(frequency);
+            const cents = getCentsOffset(frequency);
+            
+            // 預設的準度指示器（完美準確）
+            let display = '[---------|---------]';
+            
+            if (Math.abs(cents) <= 5) {
+                // 在 ±5 音分內認為是準確的
+                display = '[---------|---------]';
+            } else if (cents > 0) {
+                // 偏高：在右邊顯示 > 符號
+                const arrows = Math.min(9, Math.floor((cents - 1) / 5) + 1);
+                const leftDashes = '-'.repeat(9);
+                const rightDashes = '-'.repeat(9 - arrows);
+                const rightArrows = '>'.repeat(arrows);
+                display = `[${leftDashes}|${rightArrows}${rightDashes}]`;
+            } else {
+                // 偏低：在左邊顯示 < 符號
+                const arrows = Math.min(9, Math.floor((-cents - 1) / 5) + 1);
+                const leftDashes = '-'.repeat(9 - arrows);
+                const leftArrows = '<'.repeat(arrows);
+                const rightDashes = '-'.repeat(9);
+                display = `[${leftDashes}${leftArrows}|${rightDashes}]`;
+            }
+            const centsDisplay = cents >= 0 ? `+${cents}` : `${cents}`;
+            return `${note.padEnd(3)} \n ${frequency.toFixed(1)} Hz \n ${display} (${centsDisplay})`;
+        }
+        
+        /**
+         * 在畫布上繪製游標線
+         * 游標線顯示當前的繪圖位置
+         */
+        function drawCursor() {
+            ctx.strokeStyle = '#eee'; // 淺灰色
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(canvasX, 0);                // 從畫布頂部開始
+            ctx.lineTo(canvasX, canvas.height);    // 畫到底部
+            ctx.stroke();
+        }
+        
+        /**
+         * 頁面載入完成後的初始化函數
+         */
+        window.onload = function() {
+            // 取得各個 UI 元素的引用
+            outputArea = document.getElementById('output');
+            statusDiv = document.getElementById('status');
+            canvas = document.getElementById('canvas');
+            ctx = canvas.getContext('2d');
+            
+            // 清空畫布
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // 檢查瀏覽器是否支援麥克風存取
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                showStatus('您的瀏覽器不支援麥克風存取。');
+                return;
+            }
+            
+            showStatus('準備就緒，請按「開始」按鈕。');
+        };
+        
+        /**
+         * 開始音高偵測
+         * 這是整個程式的主要入口點
+         */
+        async function startDetection() {
+            try {
+                showStatus('正在請求麥克風權限……');
+                
+                // 請求麥克風權限並設定音訊參數
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 48000,        // 高取樣率以提高精確度
+                        channelCount: 1,          // 單聲道
+                        echoCancellation: false,  // 關閉回音消除
+                        noiseSuppression: false,  // 關閉噪音抑制
+                        autoGainControl: false    // 關閉自動增益控制
+                    }
+                });
+                
+                // 創建音訊處理環境
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 48000
+                });
+                
+                // 創建音訊來源節點
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                
+                // 創建音訊分析器
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 2048;              // FFT 大小，影響頻率解析度
+                analyser.minDecibels = -100;          // 最小分貝值
+                analyser.maxDecibels = -10;           // 最大分貝值
+                analyser.smoothingTimeConstant = 0.85; // 頻譜平滑常數
+                
+                // 連接音訊節點
+                source.connect(analyser);
+                
+                // 更新 UI 狀態
+                isDetecting = true;
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = false;
+                
+                showStatus('偵測音高中，請發出聲音。');
+                outputArea.textContent = '';
+                
+                // 初始化繪圖變數
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                canvasX = 0;
+                frequencyHistory = [];
+                smoothedFrequency = null;
+                previousValueToDisplay = 0;
+                smoothingCount = 0;
+                lastDrawTime = 0;
+                shouldStartNewLine = false;
+                
+                // 開始偵測循環
+                detectPitch();
+                
+            } catch (error) {
+                console.error('啟動偵測失敗:', error);
+                showStatus('無法存取麥克風: ' + error.message);
+            }
+        }
+        
+        /**
+         * 音高偵測的主循環
+         * 這個函數會持續執行，直到停止偵測
+         */
+        function detectPitch() {
+            if (!isDetecting) return;
+            
+            // 從分析器取得時域資料（波形資料）
+            const bufferLength = analyser.fftSize;
+            const buffer = new Float32Array(bufferLength);
+            analyser.getFloatTimeDomainData(buffer);
+            
+            // 使用自動相關函數偵測音高
+            const autoCorrelateValue = autoCorrelate(buffer, audioContext.sampleRate);
+            
+            let message;
+            let rawFrequency = null;
+            
+            if (autoCorrelateValue === -1) {
+                // 未偵測到音高的情況
+                message = ``;
+                smoothingCount = 0;
+                shouldStartNewLine = true;
+                
+                outputArea.textContent = message;
+                
+                // 沒聲音時：清除游標位置並畫游標線
+                ctx.clearRect(canvasX, 0, 3, canvas.height);
+                drawCursor();
+                canvasX += 2;
+                if (canvasX >= canvas.width) canvasX = 0;
+                
+                // 繼續下一次偵測
+                animationId = requestAnimationFrame(detectPitch);
+                return;
+            } else {
+                // 偵測到音高
+                rawFrequency = autoCorrelateValue;
+                
+                /**
+                 * 檢查新的頻率值是否與上次顯示的值足夠相似
+                 * 這是平滑機制的關鍵函數
+                 */
+                function frequencyIsSimilarEnough() {
+                    return Math.abs(rawFrequency - previousValueToDisplay) < smoothingThreshold;
+                }
+                
+                if (frequencyIsSimilarEnough()) {
+                    // 頻率穩定的情況
+                    if (smoothingCount < smoothingCountThreshold) {
+                        // 還在等待數值穩定
+                        smoothingCount++;
+                        if (previousValueToDisplay > 0) {
+                            smoothedFrequency = previousValueToDisplay;
+                            outputArea.textContent = getTuningDisplay(smoothedFrequency);
+                        } else {
+                            outputArea.textContent = ``;
+                        }
+                        
+                        // 繪製頻率或游標
+                        if (smoothedFrequency) {
+                            drawFrequency(smoothedFrequency);
+                        } else {
+                            ctx.clearRect(canvasX, 0, 3, canvas.height);
+                            drawCursor();
+                            canvasX += 2;
+                            if (canvasX >= canvas.width) canvasX = 0;
+                        }
+                        
+                        animationId = requestAnimationFrame(detectPitch);
+                        return;
+                    } else {
+                        // 數值已經穩定，可以顯示
+                        previousValueToDisplay = rawFrequency;
+                        smoothedFrequency = rawFrequency;
+                        smoothingCount = 0;
+                    }
+                } else {
+                    // 頻率不穩定的情況
+                    previousValueToDisplay = rawFrequency;
+                    smoothingCount = 0;
+                    if (smoothedFrequency === null) {
+                        smoothedFrequency = rawFrequency;
+                    }
+                    
+                    // 顯示不穩定狀態
+                    if (smoothedFrequency) {
+                        outputArea.textContent = getTuningDisplay(smoothedFrequency);
+                    } else {
+                        outputArea.textContent = ``;
+                    }
+                    
+                    // 繪製頻率或游標
+                    if (smoothedFrequency) {
+                        drawFrequency(smoothedFrequency);
+                    } else {
+                        ctx.clearRect(canvasX, 0, 3, canvas.height);
+                        drawCursor();
+                        canvasX += 2;
+                        if (canvasX >= canvas.width) canvasX = 0;
+                    }
+                    
+                    animationId = requestAnimationFrame(detectPitch);
+                    return;
+                }
+            }
+            
+            // 顯示最終結果並繪製
+            outputArea.textContent = getTuningDisplay(smoothedFrequency);
+            drawFrequency(smoothedFrequency);
+            
+            // 繼續下一次偵測
+            animationId = requestAnimationFrame(detectPitch);
+        }
+        
+        /**
+         * 停止音高偵測
+         * 清理所有資源並重置 UI 狀態
+         */
+        function stopDetection() {
+            isDetecting = false;
+            
+            // 停止動畫循環
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+            
+            // 關閉麥克風串流
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+            }
+            
+            // 關閉音訊環境
+            if (audioContext) {
+                audioContext.close();
+            }
+            
+            // 重置按鈕狀態
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            
+            showStatus('偵測已停止。');
+        }
+        
+        /**
+         * 顯示狀態訊息
+         * @param {string} message - 要顯示的訊息
+         */
+        function showStatus(message) {
+            statusDiv.textContent = message;
+        }
+        
+        /**
+         * 在畫布上繪製頻率
+         * 這個函數負責視覺化頻率資料
+         * 
+         * @param {number} frequency - 要繪製的頻率值
+         */
+        function drawFrequency(frequency) {
+            // 過濾無效或超出範圍的頻率
+            if (!frequency || frequency < 40 || frequency > 1760) {
+                ctx.clearRect(canvasX, 0, 3, canvas.height);
+                drawCursor();
+                canvasX += 2;
+                if (canvasX >= canvas.width) canvasX = 0;
+                return;
+            }
+            
+            const currentTime = Date.now();
+            
+            // 如果間隔太久，開始新的線段
+            if (lastDrawTime > 0 && (currentTime - lastDrawTime) > 500) {
+                shouldStartNewLine = true;
+            }
+            
+            lastDrawTime = currentTime;
+            
+            // 將頻率轉換為畫布上的 Y 座標
+            // 使用對數刻度，因為人類對頻率的感知是對數性的
+            const minFreq = 40;   // 最低頻率
+            const maxFreq = 1760; // 最高頻率
+            const logMinFreq = Math.log2(minFreq);
+            const logMaxFreq = Math.log2(maxFreq);
+            const logFreq = Math.log2(frequency);
+            
+            // 計算 Y 座標（畫布座標系統中，0 在頂部）
+            const y = canvas.height - ((logFreq - logMinFreq) / (logMaxFreq - logMinFreq)) * canvas.height;
+            
+            // 清除當前繪圖位置
+            ctx.clearRect(canvasX, 0, 3, canvas.height);
+            
+            // 如果需要開始新線段，清空歷史資料
+            if (shouldStartNewLine) {
+                frequencyHistory = [];
+                shouldStartNewLine = false;
+            }
+            
+            // 將當前點加入歷史記錄
+            frequencyHistory.push({x: canvasX, y: y});
+            
+            // 繪製頻率線
+            if (frequencyHistory.length > 1) {
+                ctx.strokeStyle = 'black';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                
+                // 只繪製與當前位置相關的點，以提高效能
+                const relevantPoints = frequencyHistory.filter(point => 
+                    Math.abs(point.x - canvasX) <= 2 || point.x === canvasX - 2
+                );
+                
+                if (relevantPoints.length > 1) {
+                    ctx.moveTo(relevantPoints[0].x, relevantPoints[0].y);
+                    for (let i = 1; i < relevantPoints.length; i++) {
+                        ctx.lineTo(relevantPoints[i].x, relevantPoints[i].y);
+                    }
+                    ctx.stroke();
+                }
+            }
+            
+            // 繪製游標線
+            drawCursor();
+            
+            // 移動到下一個繪圖位置
+            canvasX += 2;
+            if (canvasX >= canvas.width) {
+                canvasX = 0;
+                shouldStartNewLine = true;
+            }
+        }
+        
+        // 當使用者要離開頁面時，自動停止偵測以釋放資源
+        window.addEventListener('beforeunload', function() {
+            stopDetection();
+        });
+
+    /*
+    The MIT License (MIT)
+    Copyright (c) 2014 Chris Wilson
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+    
+    音高偵測演算法來自 https://github.com/cwilso/PitchDetect/
+    授權條款如上
+    
+    */
+    </script>
+</body>
+</html>
